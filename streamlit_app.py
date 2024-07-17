@@ -1,56 +1,105 @@
+import os
+import pandas as pd
 import streamlit as st
-from openai import OpenAI
+from langchain.chains import LLMChain
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# Assurez-vous que la clé API est disponible dans l'environnement
+api_key = os.getenv("OPENAI_API_KEY")
+if api_key is None:
+    st.error("L'API Key OpenAI n'est pas définie. Assurez-vous de la définir dans les variables d'environnement.")
+    st.stop()
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+os.environ["OPENAI_API_KEY"] = api_key
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# Charger le modèle OpenAI
+llm = OpenAI()
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+st.title("Analyseur de Réponses aux Sondages")
+st.write("Téléchargez les réponses du sondage pour analyser les sentiments et obtenir des recommandations.")
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# Téléchargement du fichier
+uploaded_file = st.file_uploader("Choisissez un fichier CSV", type="csv")
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+if uploaded_file is not None:
+    # Lire le fichier CSV téléchargé
+    survey_data = pd.read_csv(uploaded_file)
+    st.write("Réponses du Sondage :")
+    st.write(survey_data)
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # Définir les modèles de prompts
+    sentiment_template = PromptTemplate(
+        input_variables=["response"],
+        template="Analysez le sentiment des réponses suivantes : {response}"
+    )
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+    recommendation_template = PromptTemplate(
+        input_variables=["response"],
+        template="Fournis des recommandations d'amélioration pour le propriétaire de l'entreprise selon les commentaires de ce client : {response}"
+    )
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    # Définir les chaînes LLM
+    sentiment_chain = LLMChain(llm=llm, prompt=sentiment_template)
+    recommendation_chain = LLMChain(llm=llm, prompt=recommendation_template)
+
+    # Fonction pour traiter les réponses d'un client
+    def analyze_responses(respondent_id, combined_responses):
+        sentiment = sentiment_chain.run({"response": combined_responses})
+        recommendation = recommendation_chain.run({"response": combined_responses})
+
+        return {
+            "IDRépondant": respondent_id,
+            "Réponses": combined_responses,
+            "Sentiment": sentiment,
+            "Recommandation": recommendation
+        }
+
+    # Combiner les réponses de chaque client
+    combined_data = survey_data.groupby("IDRépondant").agg(lambda x: ' '.join(x.astype(str)))
+
+    # Générer l'analyse
+    st.write("Résultats de l'Analyse :")
+    results = []
+
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for respondent_id, row in combined_data.iterrows():
+            combined_responses = ' '.join(row[1:])
+            futures.append(executor.submit(analyze_responses, respondent_id, combined_responses))
+
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            st.write(f"**ID Répondant :** {result['IDRépondant']}")
+            st.write(f"**Réponses :** {result['Réponses']}")
+            st.write(f"**Sentiment :** {result['Sentiment']}")
+            st.write(f"**Recommandation :** {result['Recommandation']}")
+            st.write("---")
+
+    # Analyse globale
+    all_sentiments = []
+    all_recommendations = []
+
+    for result in results:
+        all_sentiments.append(result['Sentiment'])
+        all_recommendations.extend(result['Recommandation'].split(", "))  # Assuming recommendations are comma-separated
+
+    global_sentiments = dict(Counter(all_sentiments))
+    global_recommendations = dict(Counter(all_recommendations))
+
+    st.write("## Analyse Globale :")
+    
+    st.write("### Sentiments :")
+    for sentiment, count in global_sentiments.items():
+        st.write(f"{sentiment}")
+
+    st.write("### Recommandations :")
+    for recommendation, count in global_recommendations.items():
+        st.write(f"{recommendation}")
+
+    # Enregistrer éventuellement les résultats dans un nouveau fichier CSV
+    result_df = pd.DataFrame(results)
+    result_df.to_csv("resultats_analyse_sondage.csv", index=False)
